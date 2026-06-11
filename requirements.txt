@@ -7,7 +7,7 @@ SpeechRecognition
 pyaudio
 sounddevice
 opencv-python-headless
-mediapipe
+mediapipe==0.10.21
 numpy
 scipy
 librosa
