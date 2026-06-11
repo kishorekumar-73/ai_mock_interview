@@ -2,47 +2,38 @@ import cv2
 import numpy as np
 import threading
 import time
+import urllib.request
+import os
+import tempfile
 from collections import deque
 
-# ── MediaPipe new Tasks API (mediapipe >= 0.10) ──────────────────────────────
+# ── MediaPipe Tasks API (mediapipe >= 0.10) ───────────────────────────────────
+# mp.solutions was removed; use the Tasks API instead.
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 
-# FaceLandmarker is used instead of the deprecated mp.solutions.face_mesh
-_FL_OPTIONS = mp_vision.FaceLandmarkerOptions(
-    base_options=mp_python.BaseOptions(
-        model_asset_path=None,      # will be downloaded on first use
-        delegate=mp_python.BaseOptions.Delegate.CPU,
-    ),
-    output_face_blendshapes=True,   # gives us expression scores
-    num_faces=1,
+_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "face_landmarker/face_landmarker/float16/1/face_landmarker.task"
 )
+_MODEL_PATH = os.path.join(tempfile.gettempdir(), "face_landmarker.task")
 
-# Lazy-initialise the landmarker (heavyweight object) once per process
 _landmarker = None
 _landmarker_lock = threading.Lock()
 
 
 def _get_landmarker():
+    """Lazy-init the FaceLandmarker (downloads model on first call)."""
     global _landmarker
     if _landmarker is None:
         with _landmarker_lock:
             if _landmarker is None:
-                # Download the model bundle automatically
-                import urllib.request, os, tempfile
-                model_url = (
-                    "https://storage.googleapis.com/mediapipe-models/"
-                    "face_landmarker/face_landmarker/float16/1/"
-                    "face_landmarker.task"
-                )
-                model_path = os.path.join(
-                    tempfile.gettempdir(), "face_landmarker.task")
-                if not os.path.exists(model_path):
-                    urllib.request.urlretrieve(model_url, model_path)
+                if not os.path.exists(_MODEL_PATH):
+                    urllib.request.urlretrieve(_MODEL_URL, _MODEL_PATH)
                 options = mp_vision.FaceLandmarkerOptions(
                     base_options=mp_python.BaseOptions(
-                        model_asset_path=model_path,
+                        model_asset_path=_MODEL_PATH,
                         delegate=mp_python.BaseOptions.Delegate.CPU,
                     ),
                     output_face_blendshapes=True,
@@ -53,48 +44,37 @@ def _get_landmarker():
     return _landmarker
 
 
-# ── Blendshape → pseudo-emotion mapping ──────────────────────────────────────
-# MediaPipe blendshape names that correlate with each emotion bucket
+# Blendshape keys that map to each emotion bucket
 _BLENDSHAPE_MAP = {
-    "happy":    ["mouthSmileLeft", "mouthSmileRight", "cheekSquintLeft",
-                 "cheekSquintRight"],
+    "happy":    ["mouthSmileLeft", "mouthSmileRight",
+                 "cheekSquintLeft", "cheekSquintRight"],
     "sad":      ["mouthFrownLeft", "mouthFrownRight", "browInnerUp"],
-    "angry":    ["browDownLeft", "browDownRight", "noseSneerLeft",
-                 "noseSneerRight"],
+    "angry":    ["browDownLeft", "browDownRight",
+                 "noseSneerLeft", "noseSneerRight"],
     "surprise": ["browOuterUpLeft", "browOuterUpRight",
                  "eyeWideLeft", "eyeWideRight", "jawOpen"],
-    "fear":     ["eyeWideLeft", "eyeWideRight", "browInnerUp",
-                 "mouthOpen"],
-    "disgust":  ["noseSneerLeft", "noseSneerRight", "mouthLowerDownLeft",
-                 "mouthLowerDownRight"],
-    "neutral":  [],   # filled in by exclusion
+    "fear":     ["eyeWideLeft", "eyeWideRight",
+                 "browInnerUp", "mouthOpen"],
+    "disgust":  ["noseSneerLeft", "noseSneerRight",
+                 "mouthLowerDownLeft", "mouthLowerDownRight"],
 }
 
 
 def _blendshapes_to_emotions(blendshapes) -> dict:
-    """Convert a list of FaceBlendshape objects to an emotion dict (0-100)."""
     bs = {b.category_name: b.score for b in blendshapes}
-
     raw = {}
     for emotion, keys in _BLENDSHAPE_MAP.items():
-        if emotion == "neutral":
-            continue
         scores = [bs.get(k, 0.0) for k in keys]
         raw[emotion] = (sum(scores) / len(scores) * 100) if scores else 0.0
-
-    total_non_neutral = sum(raw.values())
-    raw["neutral"] = max(0.0, 100.0 - total_non_neutral)
-
-    # Normalise to 100
-    grand_total = sum(raw.values())
-    if grand_total > 0:
-        raw = {k: round(v / grand_total * 100, 1) for k, v in raw.items()}
-
+    raw["neutral"] = max(0.0, 100.0 - sum(raw.values()))
+    total = sum(raw.values())
+    if total > 0:
+        raw = {k: round(v / total * 100, 1) for k, v in raw.items()}
     return raw
 
 
 def _analyze_frame(frame) -> dict:
-    """Run face-landmark inference on a BGR frame; return emotion dict or {}."""
+    """Run inference on a BGR frame; return emotion dict or {} if no face."""
     try:
         landmarker = _get_landmarker()
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -131,7 +111,6 @@ def get_face_feedback(confidence: float, dominant_emotion: str) -> str:
         feedback.append("Try to appear more confident.")
     else:
         feedback.append("Practice smiling and maintaining composure.")
-
     emotion_map = {
         "happy":    "Positive expressions detected!",
         "neutral":  "Professional neutral expression maintained.",
@@ -146,7 +125,8 @@ def get_face_feedback(confidence: float, dominant_emotion: str) -> str:
     return " | ".join(feedback)
 
 
-# ── Public helper used by app.py for single-frame analysis ───────────────────
+# ── Public helpers (used by app.py) ──────────────────────────────────────────
+
 def analyze_frame_emotions(frame) -> dict:
     emotions = _analyze_frame(frame)
     if not emotions:
@@ -178,25 +158,25 @@ def analyze_video_file(video_path: str) -> dict:
         frame_count += 1
         if frame_count % 5 == 0:
             emotions = analyze_frame_emotions(frame)
-            for emotion, value in emotions.items():
-                if emotion in emotion_totals:
-                    emotion_totals[emotion] += value
+            for k, v in emotions.items():
+                if k in emotion_totals:
+                    emotion_totals[k] += v
             analyzed_frames += 1
     cap.release()
-
-    avg_emotions = ({k: v / analyzed_frames for k, v in emotion_totals.items()}
-                    if analyzed_frames > 0 else emotion_totals)
-    confidence_score = calculate_confidence_from_emotions(avg_emotions)
-    dominant_emotion = max(avg_emotions, key=avg_emotions.get)
+    avg = ({k: v / analyzed_frames for k, v in emotion_totals.items()}
+           if analyzed_frames > 0 else emotion_totals)
+    confidence_score = calculate_confidence_from_emotions(avg)
+    dominant = max(avg, key=avg.get)
     return {
         "confidence_score": confidence_score,
-        "dominant_emotion": dominant_emotion,
-        "emotions": {k: round(v, 1) for k, v in avg_emotions.items()},
-        "feedback": get_face_feedback(confidence_score, dominant_emotion),
+        "dominant_emotion": dominant,
+        "emotions": {k: round(v, 1) for k, v in avg.items()},
+        "feedback": get_face_feedback(confidence_score, dominant),
     }
 
 
-# ── Background monitor class ──────────────────────────────────────────────────
+# ── Background monitor ────────────────────────────────────────────────────────
+
 class ContinuousPostureMonitor:
     def __init__(self):
         self.cap = None
@@ -262,11 +242,9 @@ class ContinuousPostureMonitor:
                     "confidence_score": 0.0,
                     "dominant_emotion": "not detected",
                     "emotions": {},
-                    "feedback": ("Face not visible. "
-                                 "Please sit in front of camera."),
+                    "feedback": "Face not visible. Please sit in front of camera.",
                 }
             avg_confidence = round(sum(valid_conf) / len(valid_conf), 1)
-
             avg_emotions = {}
             for emotion in ["happy", "neutral", "sad",
                             "angry", "surprise", "fear", "disgust"]:
@@ -275,7 +253,6 @@ class ContinuousPostureMonitor:
                 avg_emotions[emotion] = (round(sum(values) / len(values), 1)
                                          if values else 0.0)
             dominant = max(avg_emotions, key=avg_emotions.get)
-
             return {
                 "question": question_number,
                 "confidence_score": avg_confidence,
