@@ -13,9 +13,6 @@ from pdf_report import generate_pdf_report
 from voice_analyzer import analyze_voice, record_audio
 from face_analyzer import ContinuousPostureMonitor
 
-# Note: face analysis uses mediapipe Tasks API internally (face_analyzer.py).
-# No mp.solutions.* imports are needed here.
-
 st.set_page_config(
     page_title="AI Mock Interview",
     page_icon="🤖",
