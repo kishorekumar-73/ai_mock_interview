@@ -1,5 +1,16 @@
 streamlit
-google-generativeai
+openai
+python-dotenv
 PyPDF2
+fpdf2
 SpeechRecognition
 pyaudio
+sounddevice
+opencv-python-headless
+deepface
+numpy
+scipy
+librosa
+matplotlib
+pandas
+pillow
