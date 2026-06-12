@@ -7,10 +7,11 @@ SpeechRecognition
 pyaudio
 sounddevice
 opencv-python-headless
-mediapipe==0.10.21
+mediapipe==0.10.35
 numpy
 scipy
 librosa
 matplotlib
 pandas
 pillow
+groq
