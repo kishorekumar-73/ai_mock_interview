@@ -1,4 +1,4 @@
-streamlit
+gradio
 openai
 python-dotenv
 PyPDF2
@@ -7,11 +7,9 @@ SpeechRecognition
 pyaudio
 sounddevice
 opencv-python-headless
-mediapipe==0.10.35
 numpy
 scipy
 librosa
 matplotlib
 pandas
 pillow
-groq
