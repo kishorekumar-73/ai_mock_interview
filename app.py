@@ -56,6 +56,8 @@ st.markdown("""
     border-left: 4px solid #6C63FF;
     font-size: 1.1em;
     margin-bottom: 20px;
+    color: white !important;
+
 }
 .feedback-box {
     background: #1E2130;
