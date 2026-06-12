@@ -1,636 +1,459 @@
-import streamlit as st
-import speech_recognition as sr
+import gradio as gr
 import cv2
+import numpy as np
 import tempfile
 import os
 import time
 import threading
-from evaluator import (extract_resume_text, extract_candidate_name,
-                       generate_questions, evaluate_answer,
-                       extract_score)
-from report import generate_report, create_score_chart, create_pie_chart
-from pdf_report import generate_pdf_report
-from voice_analyzer import analyze_voice, record_audio
-from face_analyzer import ContinuousPostureMonitor
+from collections import deque
 
-st.set_page_config(
-    page_title="AI Mock Interview",
-    page_icon="🤖",
-    layout="centered"
+from evaluator import (extract_resume_text, extract_candidate_name,
+                       generate_questions, evaluate_answer, extract_score)
+from report import generate_report
+from pdf_report import generate_pdf_report
+
+# ── Haar cascades (built into opencv-python-headless) ──
+_face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
+_eye_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_eye.xml"
 )
 
-# ── FIX 1: CSS was raw text outside st.markdown — moved inside the call ──
-st.markdown("""
-<style>
-.kk-brand {
-    position: fixed;
-    bottom: 15px;
-    right: 20px;
-    background: linear-gradient(135deg, #6C63FF, #FF6B35);
-    color: white !important;
-    padding: 8px 16px;
-    border-radius: 20px;
-    font-size: 0.85em;
-    font-weight: 700;
-    letter-spacing: 2px;
-    box-shadow: 0 4px 15px rgba(108, 99, 255, 0.4);
-    z-index: 999;
-    font-style: italic;
-}
-.big-title {
-    font-size: 3em;
-    font-weight: 800;
-    text-align: center;
-    color: #6C63FF;
-}
-.subtitle {
-    font-size: 1.2em;
-    text-align: center;
-    color: #aaa;
-    margin-bottom: 30px;
-}
-.question-box {
-    background: #1E2130;
-    padding: 20px;
-    border-radius: 12px;
-    border-left: 4px solid #6C63FF;
-    font-size: 1.1em;
-    margin-bottom: 20px;
-    color: white !important;
+# ──────────────────────────────────────────────────────────
+# Posture analysis helpers
+# ──────────────────────────────────────────────────────────
 
-}
-.feedback-box {
-    background: #1E2130;
-    padding: 20px;
-    border-radius: 12px;
-    margin-top: 15px;
-}
-.analysis-box {
-    background: #1E2130;
-    padding: 15px;
-    border-radius: 12px;
-    border-left: 4px solid #00C853;
-    margin: 10px 0;
-}
-.live-box {
-    background: #1E2130;
-    padding: 10px;
-    border-radius: 8px;
-    border-left: 4px solid #FF6B35;
-    margin: 5px 0;
-    font-size: 0.9em;
-}
-</style>
-""", unsafe_allow_html=True)
+def analyse_frame(frame_bgr):
+    """Analyse a single BGR frame. Returns metrics dict."""
+    if frame_bgr is None:
+        return {"face_detected": False, "confidence_score": 0.0,
+                "dominant_emotion": "not detected",
+                "eye_contact": 0.0, "head_pose": 0.0}
 
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+    faces = _face_cascade.detectMultiScale(
+        gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
 
-def init_state():
-    defaults = {
-        "stage": "home",
-        "resume_text": "",
-        "candidate_name": "",
-        "questions": [],
-        "answers": [],
-        "feedbacks": [],
-        "scores": [],
-        "q_index": 0,
-        "voice_results": [],
-        "face_results": [],
-        "enable_video": False,
-        "enable_voice": False,
-        "monitor": None
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
+    if len(faces) == 0:
+        return {"face_detected": False, "confidence_score": 0.0,
+                "dominant_emotion": "not detected",
+                "eye_contact": 0.0, "head_pose": 0.0}
 
-# ── FIX 2: Typo "iinit_state()" → "init_state()" ──
-init_state()
+    fx, fy, fw, fh = max(faces, key=lambda r: r[2] * r[3])
+    face_roi = gray[fy:fy + fh, fx:fx + fw]
+    eyes = _eye_cascade.detectMultiScale(
+        face_roi, scaleFactor=1.1, minNeighbors=5)
+    eye_count = min(len(eyes), 2)
 
-# KK Brand watermark — shows on every page
-st.markdown(
-    '<div class="kk-brand">✦ Created by KK ✦</div>',
-    unsafe_allow_html=True)
+    face_cx = fx + fw / 2
+    face_cy = fy + fh / 2
+    h_off = abs(face_cx / w - 0.5) * 2
+    v_off = abs(face_cy / h - 0.5) * 2
+    centre_off = (h_off + v_off) / 2
+    size_ratio = (fw * fh) / (w * h)
 
-# ─────────────────────────────
-# HOME
-# ─────────────────────────────
-if st.session_state.stage == "home":
-    st.markdown(
-        '<div class="big-title">🤖 AI Mock Interview</div>',
-        unsafe_allow_html=True)
-    st.markdown(
-        '<div class="subtitle">Upload Resume → 12 Questions'
-        ' → Live Monitoring → PDF Report</div>',
-        unsafe_allow_html=True)
+    eye_score = min(10.0, eye_count * 4.0 + 2.0)
+    size_score = min(10.0, size_ratio * 80)
+    head_score = max(1.0, min(10.0, size_score - centre_off * 5 + 5))
+    conf = round((eye_score * 0.5 + head_score * 0.5), 1)
 
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.markdown("### 📄\n**Resume**\nAI reads it")
-    with col2:
-        st.markdown("### ❓\n**12 Questions**\nPersonalized")
-    with col3:
-        st.markdown("### 🎥\n**Live Monitor**\nFace + Voice")
-    with col4:
-        st.markdown("### 📊\n**PDF Report**\nWith charts")
-
-    st.markdown("---")
-    st.markdown("### ⚙️ Interview Settings")
-    col1, col2 = st.columns(2)
-    with col1:
-        enable_video = st.toggle(
-            "🎥 Enable Camera Monitoring", value=False)
-    with col2:
-        enable_voice = st.toggle(
-            "🗣️ Enable Voice Analysis", value=False)
-
-    st.session_state.enable_video = enable_video
-    st.session_state.enable_voice = enable_voice
-
-    if enable_video:
-        st.info(
-            "Camera runs throughout ALL questions "
-            "automatically in background!")
-    if enable_voice:
-        st.info(
-            "Speak your answer — voice analyzed "
-            "after you submit!")
-
-    st.markdown("---")
-    uploaded_file = st.file_uploader(
-        "📄 Upload Your Resume (PDF only)", type=["pdf"])
-
-    if uploaded_file:
-        if st.button("🚀 Start My Interview",
-                     use_container_width=True):
-            with st.spinner("🧠 Analyzing your resume..."):
-                resume_text = extract_resume_text(uploaded_file)
-                name = extract_candidate_name(resume_text)
-                questions = generate_questions(resume_text)
-
-            st.session_state.resume_text = resume_text
-            st.session_state.candidate_name = name
-            st.session_state.questions = questions
-
-            if enable_video:
-                try:
-                    monitor = ContinuousPostureMonitor()
-                    monitor.start()
-                    st.session_state.monitor = monitor
-                    time.sleep(2)
-                except Exception as e:
-                    st.warning(f"Camera error: {e}")
-                    st.session_state.monitor = None
-
-            st.session_state.stage = "interview"
-            st.rerun()
-
-# ─────────────────────────────
-# INTERVIEW
-# ─────────────────────────────
-elif st.session_state.stage == "interview":
-    name = st.session_state.candidate_name
-    questions = st.session_state.questions
-    index = st.session_state.q_index
-    total = len(questions)
-    monitor = st.session_state.monitor
-
-    st.markdown(f"### 👋 Hello, {name}!")
-
-    # Show live camera feed
-    if monitor and monitor.is_running:
-        st.markdown(
-            '<div class="live-box">🔴 LIVE — '
-            'Camera monitoring your face</div>',
-            unsafe_allow_html=True)
-        frame = monitor.get_latest_frame()
-        if frame is not None:
-            frame = cv2.flip(frame, 1)
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            st.image(frame_rgb, caption="Live Camera", width=280)
-
-    # ── FIX 3: Guard against division by zero when total == 0 ──
-    progress = (index / total) if total > 0 else 0.0
-    st.progress(progress,
-                text=f"Q{index + 1} of {total} — "
-                     f"{int(progress * 100)}% Complete")
-
-    if st.session_state.scores:
-        avg = (sum(st.session_state.scores) /
-               len(st.session_state.scores))
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Average", f"{avg:.1f}/10")
-        with col2:
-            st.metric("Done", len(st.session_state.scores))
-        with col3:
-            st.metric("Left", total - index)
-
-    st.markdown("---")
-
-    if index < total:
-        current_q = questions[index]
-        st.markdown(
-            f'<div class="question-box">❓ '
-            f'<b>Q{index + 1}:</b> {current_q}</div>',
-            unsafe_allow_html=True)
-
-        mode = st.radio(
-            "Answer via:",
-            ["✍️ Type", "🎙️ Speak"],
-            horizontal=True)
-
-        if mode == "✍️ Type":
-            user_answer = st.text_area(
-                "Your Answer", height=150,
-                placeholder="Type detailed answer here...")
-
-            col1, col2 = st.columns(2)
-            with col1:
-                submit = st.button(
-                    "Submit ➡️", use_container_width=True)
-            with col2:
-                skip = st.button(
-                    "Skip ⏭️", use_container_width=True)
-
-            if submit and user_answer.strip():
-                with st.spinner("🧠 Evaluating..."):
-                    feedback = evaluate_answer(
-                        current_q, user_answer,
-                        st.session_state.resume_text)
-                    score = extract_score(feedback)
-
-                # Voice analysis
-                voice_result = None
-                if st.session_state.enable_voice:
-                    with st.spinner("🎙️ Analyzing voice..."):
-                        try:
-                            audio_path = record_audio(duration=5)
-                            voice_result = analyze_voice(audio_path)
-                            if os.path.exists(audio_path):
-                                os.remove(audio_path)
-                        except Exception:
-                            voice_result = None
-
-                # Posture snapshot
-                face_result = None
-                if monitor and monitor.is_running:
-                    face_result = monitor.get_snapshot(index + 1)
-                    monitor.reset_history()
-
-                st.session_state.answers.append(user_answer)
-                st.session_state.feedbacks.append(feedback)
-                st.session_state.scores.append(score)
-                st.session_state.voice_results.append(voice_result)
-                st.session_state.face_results.append(face_result)
-
-                dot = ("🟢" if score >= 7 else
-                       "🟡" if score >= 5 else "🔴")
-                st.markdown(f"### {dot} Score: {score}/10")
-                st.markdown(
-                    f'<div class="feedback-box">'
-                    f'{feedback}</div>',
-                    unsafe_allow_html=True)
-
-                if (voice_result and
-                        voice_result.get('overall_voice_score', 0) > 0):
-                    st.markdown(
-                        f'<div class="analysis-box">'
-                        f'🎙️ <b>Voice:</b> '
-                        f'{voice_result["overall_voice_score"]}/10 | '
-                        f'Confidence: {voice_result["confidence_score"]} | '
-                        f'Clarity: {voice_result["clarity_score"]}'
-                        f'</div>',
-                        unsafe_allow_html=True)
-
-                if (face_result and
-                        face_result.get('confidence_score', 0) > 0):
-                    st.markdown(
-                        f'<div class="analysis-box">'
-                        f'🎥 <b>Posture:</b> '
-                        f'{face_result["confidence_score"]}/10 | '
-                        f'Emotion: {face_result["dominant_emotion"]}'
-                        f'<br>{face_result["feedback"]}'
-                        f'</div>',
-                        unsafe_allow_html=True)
-                elif face_result:
-                    st.warning(
-                        "Face not detected. "
-                        "Please sit in front of camera.")
-
-                st.session_state.q_index += 1
-                if st.session_state.q_index >= total:
-                    if monitor:
-                        monitor.stop()
-                    st.session_state.stage = "report"
-                st.rerun()
-
-            elif skip:
-                st.session_state.answers.append("Skipped")
-                st.session_state.feedbacks.append("Skipped.")
-                st.session_state.scores.append(0)
-                st.session_state.voice_results.append(None)
-                st.session_state.face_results.append(None)
-                if monitor:
-                    monitor.reset_history()
-                st.session_state.q_index += 1
-                if st.session_state.q_index >= total:
-                    if monitor:
-                        monitor.stop()
-                    st.session_state.stage = "report"
-                st.rerun()
-
-        else:  # Speak mode
-            st.info(
-                "Click Record → speak your full answer "
-                "→ stop speaking when done")
-            if st.button("🎙️ Record Answer",
-                         use_container_width=True):
-                r = sr.Recognizer()
-                r.energy_threshold = 300
-                r.dynamic_energy_threshold = True
-                try:
-                    with sr.Microphone() as source:
-                        r.adjust_for_ambient_noise(
-                            source, duration=1)
-                        st.info(
-                            "🎙️ Listening... "
-                            "Speak your full answer!")
-                        audio = r.listen(
-                            source,
-                            timeout=30,
-                            phrase_time_limit=120)
-                    user_answer = r.recognize_google(audio)
-                    st.success(f"You said: {user_answer}")
-
-                    with st.spinner("🧠 Evaluating..."):
-                        feedback = evaluate_answer(
-                            current_q, user_answer,
-                            st.session_state.resume_text)
-                        score = extract_score(feedback)
-
-                    # Posture snapshot
-                    face_result = None
-                    if monitor and monitor.is_running:
-                        face_result = monitor.get_snapshot(
-                            index + 1)
-                        monitor.reset_history()
-
-                    st.session_state.answers.append(user_answer)
-                    st.session_state.feedbacks.append(feedback)
-                    st.session_state.scores.append(score)
-                    # ── FIX 4: Speak mode never appended voice_results
-                    #    so list lengths became mismatched with answers ──
-                    st.session_state.voice_results.append(None)
-                    st.session_state.face_results.append(face_result)
-
-                    dot = ("🟢" if score >= 7 else
-                           "🟡" if score >= 5 else "🔴")
-                    st.markdown(f"### {dot} Score: {score}/10")
-                    st.markdown(
-                        f'<div class="feedback-box">'
-                        f'{feedback}</div>',
-                        unsafe_allow_html=True)
-
-                    if (face_result and
-                            face_result.get('confidence_score', 0) > 0):
-                        st.markdown(
-                            f'<div class="analysis-box">'
-                            f'🎥 <b>Posture:</b> '
-                            f'{face_result["confidence_score"]}/10 | '
-                            f'{face_result["dominant_emotion"]}'
-                            f'<br>{face_result["feedback"]}'
-                            f'</div>',
-                            unsafe_allow_html=True)
-
-                    st.session_state.q_index += 1
-                    if st.session_state.q_index >= total:
-                        if monitor:
-                            monitor.stop()
-                        st.session_state.stage = "report"
-                    st.rerun()
-
-                except sr.WaitTimeoutError:
-                    st.error("No speech detected. Try again.")
-                except sr.UnknownValueError:
-                    st.error("Could not understand. Try again.")
-                except Exception as e:
-                    st.error(f"Error: {e}")
-
-    # ── FIX 5: Missing else-branch — if index >= total we should
-    #    redirect to report instead of silently showing nothing ──
+    if eye_score >= 7 and head_score >= 7:
+        emotion = "confident"
+    elif eye_score >= 5 and head_score >= 5:
+        emotion = "neutral"
+    elif head_score < 4:
+        emotion = "distracted"
     else:
-        if monitor:
-            monitor.stop()
-        st.session_state.stage = "report"
-        st.rerun()
+        emotion = "nervous"
 
-# ─────────────────────────────
-# REPORT
-# ─────────────────────────────
-elif st.session_state.stage == "report":
-    monitor = st.session_state.monitor
-    if monitor and monitor.is_running:
-        monitor.stop()
+    return {
+        "face_detected": True,
+        "confidence_score": conf,
+        "dominant_emotion": emotion,
+        "eye_contact": round(eye_score, 1),
+        "head_pose": round(head_score, 1),
+    }
 
-    name = st.session_state.candidate_name
-    questions = st.session_state.questions
-    answers = st.session_state.answers
-    feedbacks = st.session_state.feedbacks
-    scores = st.session_state.scores
-    voice_results = st.session_state.voice_results
-    face_results = st.session_state.face_results
 
-    report_text, average, grade, color = generate_report(
-        name, questions, answers, feedbacks, scores)
+def draw_overlay(frame_bgr, metrics):
+    """Draw bounding box + live HUD on frame. Returns RGB."""
+    frame = frame_bgr.copy()
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = _face_cascade.detectMultiScale(
+        gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
 
-    st.balloons()
-    st.markdown(f"## 🏆 Interview Complete, {name}!")
-    st.markdown("---")
+    for (fx, fy, fw, fh) in faces:
+        conf = metrics.get("confidence_score", 0)
+        color = (0, 220, 80) if conf >= 6 else (255, 200, 0) if conf >= 4 else (220, 50, 50)
+        cv2.rectangle(frame, (fx, fy), (fx + fw, fy + fh), color, 2)
+        cv2.putText(frame, f"Conf: {conf}/10",
+                    (fx, fy - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, color, 2)
 
-    # ── FIX 6: max(scores) crashes on empty list — guard it ──
-    best_score = max(scores) if scores else 0
+    # HUD bar at top
+    cv2.rectangle(frame, (0, 0), (frame.shape[1], 32), (30, 30, 30), -1)
+    emotion = metrics.get("dominant_emotion", "---")
+    eye = metrics.get("eye_contact", 0)
+    hud = f"Eye: {eye}/10  |  Posture: {metrics.get('head_pose', 0)}/10  |  State: {emotion}"
+    cv2.putText(frame, hud, (8, 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 255), 1)
 
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Average Score", f"{average:.1f}/10")
-    with col2:
-        st.metric("Questions", len(questions))
-    with col3:
-        st.metric("Grade", grade.split()[1] if len(grade.split()) > 1 else grade)
-    with col4:
-        st.metric("Best Score", f"{best_score}/10")
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-    st.markdown("---")
 
-    st.markdown("### 📊 Performance Charts")
-    chart_b64 = create_score_chart(questions, scores)
-    st.markdown(
-        f'<img src="data:image/png;base64,{chart_b64}" '
-        f'width="100%">',
-        unsafe_allow_html=True)
+# ──────────────────────────────────────────────────────────
+# Global interview state
+# ──────────────────────────────────────────────────────────
 
-    col1, col2 = st.columns(2)
-    with col1:
-        pie_b64 = create_pie_chart(scores)
-        st.markdown(
-            f'<img src="data:image/png;base64,{pie_b64}" '
-            f'width="100%">',
-            unsafe_allow_html=True)
-    with col2:
-        st.markdown("### 📈 Scores")
-        for i, (q, s) in enumerate(zip(questions, scores)):
-            dot = "🟢" if s >= 7 else "🟡" if s >= 5 else "🔴"
-            st.markdown(
-                f"{dot} **Q{i + 1}:** {q[:40]}... **{s}/10**")
+state = {
+    "questions": [], "answers": [], "feedbacks": [], "scores": [],
+    "resume_text": "", "name": "", "q_index": 0, "active": False,
+    "posture_snapshots": [],   # list of metrics dicts, one per question
+    "latest_metrics": {},      # from last camera frame
+}
 
-    # Voice summary
-    valid_voice = [
-        v for v in voice_results
-        if v is not None and v.get('overall_voice_score', 0) > 0]
-    if valid_voice:
-        st.markdown("---")
-        st.markdown("### 🎙️ Voice Analysis")
-        avg_voice = (sum(
-            v['overall_voice_score'] for v in valid_voice
-        ) / len(valid_voice))
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Voice Score", f"{avg_voice:.1f}/10")
-        with col2:
-            avg_conf = (sum(
-                v['confidence_score'] for v in valid_voice
-            ) / len(valid_voice))
-            st.metric("Confidence", f"{avg_conf:.1f}/10")
-        with col3:
-            avg_clarity = (sum(
-                v['clarity_score'] for v in valid_voice
-            ) / len(valid_voice))
-            st.metric("Clarity", f"{avg_clarity:.1f}/10")
 
-    # Face summary
-    valid_face = [f for f in face_results if f is not None]
-    if valid_face:
-        st.markdown("---")
-        st.markdown("### 🎥 Posture Summary")
-        avg_face = (sum(
-            f['confidence_score'] for f in valid_face
-        ) / len(valid_face))
-        emotions_list = [f['dominant_emotion'] for f in valid_face]
-        most_common = max(set(emotions_list), key=emotions_list.count)
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Posture Score", f"{avg_face:.1f}/10")
-        with col2:
-            st.metric("Dominant Emotion", most_common.title())
-        with col3:
-            positive = sum(
-                1 for e in emotions_list
-                if e in ['happy', 'neutral'])
-            st.metric("Positive",
-                      f"{positive}/{len(emotions_list)}")
+# ──────────────────────────────────────────────────────────
+# Interview logic
+# ──────────────────────────────────────────────────────────
 
-    st.markdown("---")
+def start_interview(resume_file):
+    if resume_file is None:
+        return ("Please upload a resume!",
+                gr.update(visible=False), "", gr.update(visible=False))
+    try:
+        with open(resume_file.name, 'rb') as f:
+            resume_text = extract_resume_text(f)
+        name = extract_candidate_name(resume_text)
+        questions = generate_questions(resume_text)
 
-    # Detailed feedback
-    st.markdown("### 📝 Detailed Feedback")
-    for i, (q, a, f, s) in enumerate(
-            zip(questions, answers, feedbacks, scores)):
-        dot = "🟢" if s >= 7 else "🟡" if s >= 5 else "🔴"
-        with st.expander(
-                f"{dot} Q{i + 1}: {q[:50]}... Score:{s}/10"):
-            st.markdown(f"**Answer:** {a}")
-            st.markdown("**Feedback:**")
-            st.markdown(
-                f'<div class="feedback-box">{f}</div>',
-                unsafe_allow_html=True)
-            if (i < len(voice_results) and
-                    voice_results[i] is not None and
-                    voice_results[i].get(
-                        'overall_voice_score', 0) > 0):
-                v = voice_results[i]
-                st.markdown(
-                    f'<div class="analysis-box">'
-                    f'Voice: {v["overall_voice_score"]}/10 | '
-                    f'Confidence: {v["confidence_score"]} | '
-                    f'Clarity: {v["clarity_score"]}'
-                    f'</div>',
-                    unsafe_allow_html=True)
-            if (i < len(face_results) and
-                    face_results[i] is not None and
-                    face_results[i].get(
-                        'confidence_score', 0) > 0):
-                fr = face_results[i]
-                st.markdown(
-                    f'<div class="analysis-box">'
-                    f'Posture: {fr["confidence_score"]}/10 | '
-                    f'Emotion: {fr["dominant_emotion"]}'
-                    f'<br>{fr["feedback"]}'
-                    f'</div>',
-                    unsafe_allow_html=True)
+        state.update({
+            "resume_text": resume_text, "name": name,
+            "questions": questions, "answers": [], "feedbacks": [],
+            "scores": [], "q_index": 0, "active": True,
+            "posture_snapshots": [], "latest_metrics": {},
+        })
 
-    st.markdown("---")
+        first_q = questions[0] if questions else "No questions generated"
+        status = f"✅ Welcome {name}! {len(questions)} questions ready."
+        progress = f"Question 1 of {len(questions)}"
+        return (status,
+                gr.update(visible=True),
+                f"**{progress}**\n\n{first_q}",
+                gr.update(visible=False))
+    except Exception as e:
+        return (f"Error: {str(e)}",
+                gr.update(visible=False), "", gr.update(visible=False))
 
-    # PDF generation
-    with st.spinner("📄 Generating PDF..."):
-        voice_summary = None
-        if valid_voice:
-            voice_summary = {
-                'confidence_score': round(sum(
-                    v['confidence_score']
-                    for v in valid_voice) / len(valid_voice), 1),
-                'clarity_score': round(sum(
-                    v['clarity_score']
-                    for v in valid_voice) / len(valid_voice), 1),
-                'pace_score': round(sum(
-                    v['pace_score']
-                    for v in valid_voice) / len(valid_voice), 1),
-                'overall_voice_score': round(sum(
-                    v['overall_voice_score']
-                    for v in valid_voice) / len(valid_voice), 1),
-                'feedback': valid_voice[-1].get('feedback', '')
-            }
 
+def _process_answer(answer_text, metrics_snapshot):
+    """Core: evaluate answer, store posture, advance question."""
+    if not state["active"]:
+        return "Please start interview first!", "", gr.update(visible=False)
+
+    idx = state["q_index"]
+    questions = state["questions"]
+    if idx >= len(questions):
+        return "Interview complete!", "", gr.update(visible=False)
+
+    current_q = questions[idx]
+    feedback = evaluate_answer(current_q, answer_text, state["resume_text"])
+    score = extract_score(feedback)
+
+    state["answers"].append(answer_text)
+    state["feedbacks"].append(feedback)
+    state["scores"].append(score)
+    state["posture_snapshots"].append(metrics_snapshot or {})
+    state["q_index"] += 1
+
+    next_idx = state["q_index"]
+
+    if next_idx >= len(questions):
+        state["active"] = False
+        _, average, grade, _ = generate_report(
+            state["name"], questions,
+            state["answers"], state["feedbacks"], state["scores"])
+        score_emoji = "🟢" if score >= 7 else "🟡" if score >= 5 else "🔴"
+        fb_display = (
+            f"{score_emoji} **Score: {score}/10**\n\n{feedback}\n\n"
+            f"---\n🏁 **Interview Complete!**\n"
+            f"Average: **{average:.1f}/10** | Grade: **{grade}**"
+        )
+        return (fb_display,
+                "✅ Interview finished! Go to Download Report tab.",
+                gr.update(visible=True))
+
+    next_q = questions[next_idx]
+    progress = f"Question {next_idx+1} of {len(questions)}"
+    score_emoji = "🟢" if score >= 7 else "🟡" if score >= 5 else "🔴"
+    fb_display = (
+        f"{score_emoji} **Score: {score}/10**\n\n{feedback}"
+    )
+    return (fb_display,
+            f"**{progress}**\n\n{next_q}",
+            gr.update(visible=False))
+
+
+def submit_text_answer(answer_text):
+    metrics = state.get("latest_metrics", {})
+    return _process_answer(answer_text, metrics)
+
+
+def submit_voice_answer(audio_file):
+    if audio_file is None:
+        return "No audio recorded!", "", gr.update(visible=False)
+    try:
+        import speech_recognition as sr
+        r = sr.Recognizer()
+        with sr.AudioFile(audio_file) as source:
+            audio = r.record(source)
+        text = r.recognize_google(audio)
+        fb, prog, dl = _process_answer(text, state.get("latest_metrics", {}))
+        return f"🎙️ You said: *{text}*\n\n{fb}", prog, dl
+    except Exception as e:
+        return f"Could not process audio: {str(e)}", "", gr.update(visible=False)
+
+
+# ──────────────────────────────────────────────────────────
+# Continuous camera feed (Gradio streaming)
+# ──────────────────────────────────────────────────────────
+
+def process_camera_frame(frame_rgb):
+    """
+    Called repeatedly by gr.Image with streaming=True.
+    frame_rgb: numpy array H×W×3 (RGB) from webcam.
+    Returns: annotated RGB frame + status string.
+    """
+    if frame_rgb is None:
+        return None, "Camera not active"
+
+    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+    metrics = analyse_frame(frame_bgr)
+    state["latest_metrics"] = metrics   # save for answer submission
+
+    annotated = draw_overlay(frame_bgr, metrics)
+
+    if not metrics["face_detected"]:
+        status = "⚠️ No face detected — please sit in front of camera"
+    else:
+        conf = metrics["confidence_score"]
+        emotion = metrics["dominant_emotion"]
+        eye = metrics["eye_contact"]
+        status = (
+            f"✅ Face detected | "
+            f"Confidence: {conf}/10 | "
+            f"Eye contact: {eye}/10 | "
+            f"State: {emotion}"
+        )
+    return annotated, status
+
+
+# ──────────────────────────────────────────────────────────
+# PDF download
+# ──────────────────────────────────────────────────────────
+
+def download_pdf():
+    if not state["scores"]:
+        return None
+
+    # Aggregate posture snapshots into one summary
+    snapshots = [s for s in state["posture_snapshots"] if s.get("face_detected")]
+    if snapshots:
+        avg_conf = round(
+            sum(s["confidence_score"] for s in snapshots) / len(snapshots), 1)
+        emotions = [s["dominant_emotion"] for s in snapshots]
+        dominant = max(set(emotions), key=emotions.count)
+        face_summary = {
+            "confidence_score": avg_conf,
+            "dominant_emotion": dominant,
+            "eye_contact": round(
+                sum(s.get("eye_contact", 0) for s in snapshots) / len(snapshots), 1),
+            "head_pose": round(
+                sum(s.get("head_pose", 0) for s in snapshots) / len(snapshots), 1),
+        }
+    else:
         face_summary = None
-        if valid_face:
-            avg_face_score = round(sum(
-                f['confidence_score']
-                for f in valid_face) / len(valid_face), 1)
-            emotions_list = [
-                f['dominant_emotion'] for f in valid_face]
-            most_common_emotion = max(
-                set(emotions_list), key=emotions_list.count)
-            fb_lines = valid_face[-1].get('feedback', '').split(' | ')
-            unique_fb = list(dict.fromkeys(fb_lines))
-            face_summary = {
-                'confidence_score': avg_face_score,
-                'dominant_emotion': most_common_emotion,
-                'feedback': ' | '.join(unique_fb[:3])
-            }
 
+    try:
         pdf_bytes = generate_pdf_report(
-            name, questions, answers, feedbacks, scores,
-            voice_summary, face_summary)
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.download_button(
-            label="📥 Download PDF",
-            data=pdf_bytes,
-            file_name=f"{name}_report.pdf",
-            mime="application/pdf",
-            use_container_width=True
+            state["name"],
+            state["questions"],
+            state["answers"],
+            state["feedbacks"],
+            state["scores"],
+            voice_data=None,
+            face_data=face_summary,
         )
-    with col2:
-        st.download_button(
-            label="📄 Download MD",
-            data=report_text,
-            file_name=f"{name}_report.md",
-            mime="text/markdown",
-            use_container_width=True
+        tmp = tempfile.mktemp(suffix='.pdf')
+        with open(tmp, 'wb') as f:
+            f.write(pdf_bytes)
+        return tmp
+    except Exception as e:
+        print(f"PDF error: {e}")
+        return None
+
+
+# ──────────────────────────────────────────────────────────
+# UI
+# ──────────────────────────────────────────────────────────
+
+CSS = """
+body { font-family: 'Segoe UI', sans-serif; }
+.title-block { text-align:center; padding: 10px 0 4px 0; }
+.title-block h1 { font-size: 2.2em; font-weight: 900;
+    background: linear-gradient(90deg,#6C63FF,#ff6584);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+.title-block p { color: #888; margin-top: 0; }
+.question-box textarea { font-size: 1.1em !important;
+    font-weight: 600 !important; color: #fff !important;
+    background: #1a1a2e !important; border-radius: 10px !important; }
+.feedback-box textarea { font-size: 0.97em !important;
+    background: #111 !important; color: #eee !important; }
+.status-bar { background:#1e1e2e; border-radius:8px;
+    padding:8px 14px; color:#a0a0ff; font-size:0.9em; }
+.gr-button-primary { background: linear-gradient(90deg,#6C63FF,#8b5cf6) !important;
+    border: none !important; font-weight: 700 !important; }
+.kk { text-align:right; color:#6C63FF; font-style:italic;
+    font-weight:bold; padding: 8px 16px; }
+footer { display: none !important; }
+"""
+
+THEME = gr.themes.Base(
+    primary_hue="violet",
+    secondary_hue="pink",
+    neutral_hue="slate",
+).set(
+    body_background_fill="#0d0d1a",
+    block_background_fill="#141428",
+    block_border_color="#2a2a4a",
+    input_background_fill="#1a1a2e",
+    body_text_color="#e0e0f0",
+    block_title_text_color="#a0a0ff",
+)
+
+with gr.Blocks(theme=THEME, css=CSS, title="AI Mock Interview") as demo:
+
+    gr.HTML("""
+    <div class="title-block">
+      <h1>🤖 AI Mock Interview System</h1>
+      <p>Upload your resume → get personalised questions →
+         answer & get instant AI feedback → download PDF report</p>
+    </div>
+    """)
+
+    # ── TAB 1: Interview ──────────────────────────────────
+    with gr.Tab("📄 Interview"):
+        with gr.Row():
+            # Left column: resume + start
+            with gr.Column(scale=1, min_width=260):
+                resume_input = gr.File(
+                    label="📎 Upload Resume (PDF)",
+                    file_types=[".pdf"])
+                start_btn = gr.Button(
+                    "🚀 Start Interview", variant="primary", size="lg")
+                status_box = gr.Textbox(
+                    label="Status", interactive=False,
+                    elem_classes=["status-bar"])
+
+            # Right column: question + answer
+            with gr.Column(scale=2):
+                question_md = gr.Markdown(
+                    "Upload your resume and click **Start Interview**",
+                    elem_classes=["question-box"])
+
+                with gr.Tab("✍️ Type Answer"):
+                    text_answer = gr.Textbox(
+                        label="Your Answer", lines=5,
+                        placeholder="Type your answer here…")
+                    submit_text_btn = gr.Button(
+                        "Submit Answer ➡️", variant="primary")
+
+                with gr.Tab("🎙️ Voice Answer"):
+                    voice_input = gr.Audio(
+                        label="Record Your Answer",
+                        sources=["microphone"], type="filepath")
+                    submit_voice_btn = gr.Button(
+                        "Submit Voice Answer 🎙️", variant="primary")
+
+                feedback_md = gr.Markdown("", elem_classes=["feedback-box"])
+
+                download_done = gr.Markdown("", visible=False)
+
+    # ── TAB 2: Camera Monitor ─────────────────────────────
+    with gr.Tab("🎥 Live Camera Monitor"):
+        gr.Markdown(
+            "### Continuous Posture & Confidence Monitor\n"
+            "Keep this tab open during your interview. "
+            "The camera analyses your posture every second and saves "
+            "a snapshot when you submit each answer.")
+        with gr.Row():
+            with gr.Column(scale=3):
+                camera_feed = gr.Image(
+                    label="Live Feed",
+                    sources=["webcam"],
+                    streaming=True,          # continuous stream
+                    type="numpy",
+                    mirror_webcam=True,
+                )
+            with gr.Column(scale=1):
+                cam_status = gr.Textbox(
+                    label="Live Analysis",
+                    interactive=False,
+                    lines=6,
+                    elem_classes=["status-bar"])
+                gr.Markdown("""
+**What is monitored:**
+- 👁️ Eye contact score
+- 🧍 Head position & posture
+- 😐 Confidence state
+- 📸 Auto-snapshot per answer
+                """)
+
+        camera_feed.stream(
+            fn=process_camera_frame,
+            inputs=[camera_feed],
+            outputs=[camera_feed, cam_status],
         )
 
-    if st.button("🔄 New Interview", use_container_width=True):
-        for key in list(st.session_state.keys()):
-            del st.session_state[key]
-        st.rerun()
+    # ── TAB 3: Download ───────────────────────────────────
+    with gr.Tab("📥 Download Report"):
+        gr.Markdown("### Download your full interview report as PDF")
+        gr.Markdown(
+            "The PDF includes:\n"
+            "- All questions, answers, and AI feedback\n"
+            "- Score charts\n"
+            "- **Posture & body language analysis** (5–8 lines per metric)\n"
+            "- Recommendations")
+        dl_btn = gr.Button(
+            "📥 Generate PDF Report", variant="primary", size="lg")
+        pdf_output = gr.File(label="Your Report")
+        dl_btn.click(fn=download_pdf, inputs=[], outputs=[pdf_output])
+
+    gr.HTML('<div class="kk">✦ Created by KK ✦</div>')
+
+    # ── Wiring ────────────────────────────────────────────
+    def _start(rf):
+        status, _, question, _ = start_interview(rf)
+        return status, question
+
+    start_btn.click(
+        fn=_start,
+        inputs=[resume_input],
+        outputs=[status_box, question_md]
+    )
+
+    submit_text_btn.click(
+        fn=submit_text_answer,
+        inputs=[text_answer],
+        outputs=[feedback_md, question_md, download_done])
+
+    submit_voice_btn.click(
+        fn=submit_voice_answer,
+        inputs=[voice_input],
+        outputs=[feedback_md, question_md, download_done])
+
+
+if __name__ == "__main__":
+    demo.launch(share=True)
