@@ -127,4 +127,4 @@ This project uses [OpenRouter](https://openrouter.ai) to route requests to model
 
 ## 🙏 Credits
 
-Created by **KK**
+Created by **KISHORE KUMAR**
