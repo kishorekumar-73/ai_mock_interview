@@ -56,7 +56,7 @@ An AI-powered mock interview platform built with Python and Gradio that generate
 Clone the repository:
 
 ```bash
-git clone https://github.com/your-username/ai-mock-interview.git
+https://github.com/kishorekumar-73/ai_mock_interview
 cd ai-mock-interview
 ```
 
